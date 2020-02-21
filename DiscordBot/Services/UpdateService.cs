@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Discord;
@@ -140,13 +141,13 @@ namespace DiscordBot.Services
                     {
                         while (_client.ConnectionState != ConnectionState.Connected || _client.LoginState != LoginState.LoggedIn)
                             await Task.Delay(100, _token);
-                        await Task.Delay(1000, _token);
+                        await Task.Delay(10000, _token);
                         //Check if there are users still muted
                         foreach (var userID in _userData.MutedUsers)
                         {
                             if (_userData.MutedUsers.HasUser(userID.Key, evenIfCooldownNowOver: true))
                             {
-                                SocketGuild guild = _client.Guilds.First();
+                                SocketGuild guild = _client.Guilds.First(g => g.Id == _settings.guildId);
                                 SocketGuildUser sgu = guild.GetUser(userID.Key);
                                 if (sgu == null)
                                 {
@@ -163,7 +164,7 @@ namespace DiscordBot.Services
                                 }
 
                                 //Setup delay to remove role when time is up.
-                                await Task.Run(async () =>
+                                Task.Run(async () =>
                                 {
                                     await _userData.MutedUsers.AwaitCooldown(user.Id);
                                     await user.RemoveRoleAsync(mutedRole);
@@ -277,6 +278,7 @@ namespace DiscordBot.Services
 
         private async void UpdateAnime()
         {
+            return;
             await Task.Delay(TimeSpan.FromSeconds(30d), _token);
             while (true)
             {
@@ -415,38 +417,73 @@ namespace DiscordBot.Services
                 await Task.Delay(TimeSpan.FromSeconds(30d), _token);
             }
         }
-
-        public async Task<String> DownloadWikipediaArticle(String articleName)
+        /// <summary>
+        /// JSON object for the Wikipedia command to convert results to.
+        /// </summary>
+        private partial class WikiPage
         {
+            [JsonProperty("index")]
+            public long Index { get; set; }
 
-            String url = Uri.EscapeUriString(_settings.WikipediaSearchPage + articleName);
+            [JsonProperty("title")]
+            public string Title { get; set; }
 
+            [JsonProperty("extract")]
+            public string Extract { get; set; }
+
+            [JsonProperty("fullurl")]
+            public Uri FullURL { get; set; }
+        }
+
+        public async Task<(string name, string extract, string url)> DownloadWikipediaArticle(string searchQuery)
+        {
+            string wikiSearchUri = Uri.EscapeUriString(_settings.WikipediaSearchPage + searchQuery);
+            HtmlWeb htmlWeb = new HtmlWeb() { CaptureRedirect = true };
+            HtmlDocument wikiSearchResponse;
+
+            try { wikiSearchResponse = await htmlWeb.LoadFromWebAsync(wikiSearchUri); }
+            catch
+            {
+                Console.WriteLine("Wikipedia method failed loading URL: " + wikiSearchUri);
+                return (null, null, null);
+            }
             try
             {
-                HtmlWeb htmlWeb = new HtmlWeb();
-                htmlWeb.CaptureRedirect = true;
+                JObject job = JObject.Parse(wikiSearchResponse.Text);
 
-                HtmlDocument manual = await htmlWeb.LoadFromWebAsync(url);
+                if(job.TryGetValue("query", out var query))
+                {
+                    var pages = JsonConvert.DeserializeObject<List<WikiPage>>(job[query.Path]["pages"].ToString(), new JsonSerializerSettings() { NullValueHandling = NullValueHandling.Ignore });
+                    
+                    if (pages != null && pages.Count > 0)
+                    {
+                        pages.Sort((x, y) => x.Index.CompareTo(y.Index)); //Sort from smallest index to biggest, smallest index is indicitive of best matching result
+                        var page = pages[0];
 
-                String jsonData = manual.DocumentNode.OuterHtml;
-
-                dynamic json = JObject.Parse(jsonData);
-
-                //2 hours have been spent trying to get this to work - just a warning to not stuff it up
-                foreach(JToken token in json["query"]["pages"].Children()) {
-                    //If its null its not an article
-                    if (token.First["extract"] == null) {
-                        break;
+                        const string referToString = "may refer to:\n";
+                        int referToIndex = page.Extract.IndexOf(referToString);
+                        //If a multi-refer result was given, reformat title to indicate this and strip the "may refer to" portion from the body
+                        if(referToIndex > 0)
+                        {
+                            int splitIndex = referToIndex + referToString.Length;
+                            page.Title = page.Extract.Substring(0, splitIndex - 2); //-2 to strip the useless \n since this will be a title
+                            page.Extract = page.Extract.Substring(splitIndex);
+                            page.Extract.Replace("\n", Environment.NewLine + "-");
+                        } 
+                        else { page.Extract = page.Extract.Replace("\n", Environment.NewLine); }
+                        
+                        return (page.Title + ":", page.Extract, page.FullURL.ToString());
                     }
-
-                    return token.First["extract"].ToString();
                 }
-                
-            } catch (Exception e)
+                else { return (null, null, null); }
+            }
+            catch (Exception e)
             {
                 Console.WriteLine(e);
+                Console.WriteLine("Wikipedia method likely failed to parse JSON response from: " + wikiSearchUri);
             }
-            return null;
+
+            return (null, null, null);
         }
 
         public UserData GetUserData()
